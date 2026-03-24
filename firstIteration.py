@@ -46,8 +46,24 @@ class CFG:
         return len(self.edges)
 
 
-def cyclomatic_complexity(E: int, N: int, P: int = 1) -> int:
+def cyclomatic_complexity_cfg(E: int, N: int, P: int = 1) -> int:
     return E - N + 2 * P
+
+
+def cyclomatic_complexity_decision(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """
+    Decision-based cyclomatic complexity.
+    Counts:
+    - if / elif   -> ast.If
+    - for         -> ast.For
+    - while       -> ast.While
+    - try/except  -> ast.Try
+    """
+    decisions = 0
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.Try)):
+            decisions += 1
+    return decisions + 1
 
 
 def count_boolops(expr: ast.AST) -> int:
@@ -58,8 +74,24 @@ def count_boolops(expr: ast.AST) -> int:
     return extra
 
 
-class CFGBuilder:
+def compute_extras(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    extra = 0
+    for node in ast.walk(fn):
+        if isinstance(node, ast.If):
+            extra += count_boolops(node.test)
+        elif isinstance(node, ast.While):
+            extra += count_boolops(node.test)
+        elif isinstance(node, ast.IfExp):
+            extra += 1 + count_boolops(node.test)
+        elif isinstance(node, ast.Assert):
+            extra += count_boolops(node.test)
+    return extra
 
+
+class CFGBuilder:
+    def __init__(self) -> None:
+        # stack of (loop_condition_node, loop_exit_merge_node)
+        self.loop_stack: List[Tuple[int, int]] = []
 
     def build_for_function(self, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> CFG:
         cfg = CFG()
@@ -71,7 +103,12 @@ class CFGBuilder:
                 cfg.add_edge(ep, cfg.exit)
         return cfg
 
-    def _build_block(self, cfg: CFG, stmts: List[ast.stmt], incoming: Set[int]) -> Tuple[Set[int], Set[int]]:
+    def _build_block(
+        self,
+        cfg: CFG,
+        stmts: List[ast.stmt],
+        incoming: Set[int]
+    ) -> Tuple[Set[int], Set[int]]:
         if not stmts:
             return set(), set(incoming)
 
@@ -84,32 +121,68 @@ class CFGBuilder:
                 start_nodes |= st_start
             current_incoming = st_end
 
+            # terminal flow: stop chaining the rest of the block
+            if not current_incoming:
+                break
+
         return start_nodes, current_incoming
 
-    def _build_stmt(self, cfg: CFG, st: ast.stmt, incoming: Set[int]) -> Tuple[Set[int], Set[int]]:
-        # Simple statements
+    def _build_stmt(
+        self,
+        cfg: CFG,
+        st: ast.stmt,
+        incoming: Set[int]
+    ) -> Tuple[Set[int], Set[int]]:
         simple = (
-            ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Pass, ast.Return,
-            ast.Raise, ast.Import, ast.ImportFrom, ast.Assert
+            ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Pass,
+            ast.Import, ast.ImportFrom, ast.Assert
         )
+
         if isinstance(st, simple):
             n = cfg.new_node(type(st).__name__)
             for inc in incoming:
                 cfg.add_edge(inc, n)
-            if isinstance(st, (ast.Return, ast.Raise)):
-                return {n}, set()  # terminal
             return {n}, {n}
 
-        # If / elif / else
+        if isinstance(st, (ast.Return, ast.Raise)):
+            n = cfg.new_node(type(st).__name__)
+            for inc in incoming:
+                cfg.add_edge(inc, n)
+            return {n}, set()
+
+        if isinstance(st, ast.Break):
+            n = cfg.new_node("Break")
+            for inc in incoming:
+                cfg.add_edge(inc, n)
+
+            if self.loop_stack:
+                _, loop_exit = self.loop_stack[-1]
+                cfg.add_edge(n, loop_exit)
+
+            return {n}, set()
+
+        if isinstance(st, ast.Continue):
+            n = cfg.new_node("Continue")
+            for inc in incoming:
+                cfg.add_edge(inc, n)
+
+            if self.loop_stack:
+                loop_cond, _ = self.loop_stack[-1]
+                cfg.add_edge(n, loop_cond)
+
+            return {n}, set()
+
         if isinstance(st, ast.If):
             cond = cfg.new_node("IfCond")
             for inc in incoming:
                 cfg.add_edge(inc, cond)
 
+            # then branch
             _, then_end = self._build_block(cfg, st.body, incoming={cond})
             if not st.body:
                 then_end = {cond}
 
+            # else / elif branch
             _, else_end = self._build_block(cfg, st.orelse, incoming={cond})
             if not st.orelse:
                 else_end = {cond}
@@ -117,41 +190,56 @@ class CFGBuilder:
             merge = cfg.new_node("IfMerge")
             for ep in (then_end | else_end):
                 cfg.add_edge(ep, merge)
+
             return {cond}, {merge}
 
-        # Loops
         if isinstance(st, (ast.For, ast.While)):
             loop_cond = cfg.new_node(type(st).__name__ + "Cond")
             for inc in incoming:
                 cfg.add_edge(inc, loop_cond)
 
+            loop_exit = cfg.new_node(type(st).__name__ + "Merge")
+            self.loop_stack.append((loop_cond, loop_exit))
+
+            # body path
             _, body_end = self._build_block(cfg, st.body, incoming={loop_cond})
             if not st.body:
                 body_end = {loop_cond}
 
-            # back edge(s)
             for ep in body_end:
                 cfg.add_edge(ep, loop_cond)
 
-            # fall-through
-            merge = cfg.new_node(type(st).__name__ + "Merge")
-            cfg.add_edge(loop_cond, merge)
-            return {loop_cond}, {merge}
+            # false / exit path
+            cfg.add_edge(loop_cond, loop_exit)
 
-        # Try/Except (coarse)
+            self.loop_stack.pop()
+
+            # loop else support
+            if st.orelse:
+                _, else_end = self._build_block(cfg, st.orelse, incoming={loop_exit})
+                if else_end:
+                    after_else = cfg.new_node(type(st).__name__ + "ElseMerge")
+                    for ep in else_end:
+                        cfg.add_edge(ep, after_else)
+                    return {loop_cond}, {after_else}
+
+            return {loop_cond}, {loop_exit}
+
         if isinstance(st, ast.Try):
-            t = cfg.new_node("Try")
+            try_node = cfg.new_node("Try")
             for inc in incoming:
-                cfg.add_edge(inc, t)
+                cfg.add_edge(inc, try_node)
 
-            _, body_end = self._build_block(cfg, st.body, incoming={t})
+            # normal body flow
+            _, body_end = self._build_block(cfg, st.body, incoming={try_node})
             if not st.body:
-                body_end = {t}
+                body_end = {try_node}
 
+            # except handlers
             handler_ends: Set[int] = set()
             for h in st.handlers:
                 hnode = cfg.new_node("Except")
-                cfg.add_edge(t, hnode)
+                cfg.add_edge(try_node, hnode)
                 _, he = self._build_block(cfg, h.body, incoming={hnode})
                 handler_ends |= (he if he else {hnode})
 
@@ -159,13 +247,22 @@ class CFGBuilder:
             for ep in (body_end | handler_ends):
                 cfg.add_edge(ep, merge)
 
+            # try-else runs only if no exception
+            if st.orelse:
+                _, else_end = self._build_block(cfg, st.orelse, incoming=body_end if body_end else {merge})
+                if else_end:
+                    else_merge = cfg.new_node("TryElseMerge")
+                    for ep in else_end:
+                        cfg.add_edge(ep, else_merge)
+                    merge = else_merge
+
+            # finally runs regardless
             if st.finalbody:
-                _, fend = self._build_block(cfg, st.finalbody, incoming={merge})
-                return {t}, (fend if fend else {merge})
+                _, final_end = self._build_block(cfg, st.finalbody, incoming={merge})
+                return {try_node}, (final_end if final_end else {merge})
 
-            return {t}, {merge}
+            return {try_node}, {merge}
 
-        # Fallback unknown statement
         n = cfg.new_node("Stmt:" + type(st).__name__)
         for inc in incoming:
             cfg.add_edge(inc, n)
@@ -200,13 +297,20 @@ def analyze_python_source(source: str, filename: str) -> List[FunctionResult]:
     builder = CFGBuilder()
     out: List[FunctionResult] = []
 
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             cfg = builder.build_for_function(node)
             P = 1
-            base = cyclomatic_complexity(cfg.E, cfg.N, P)
+
+            # Keep CFG values for display/evidence
+            base_cfg = cyclomatic_complexity_cfg(cfg.E, cfg.N, P)
+
+            # Use decision-based complexity as the main score
+            base_decision = cyclomatic_complexity_decision(node)
+
             extras = compute_extras(node)
-            cc = base + extras
+            cc = base_decision + extras
+
             out.append(FunctionResult(
                 file=filename,
                 function=node.name,
@@ -216,6 +320,7 @@ def analyze_python_source(source: str, filename: str) -> List[FunctionResult]:
                 P=P,
                 extras=extras
             ))
+
     return out
 
 

@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 """
-CodeShield – Technical Debt & Security Scanner (Prototype UI)
-
-Features:
-- Scan a Python file or folder
-- Cyclomatic Complexity per function (simplified CFG): M = E - N + 2P (+ boolean-op extras)
-- Security red flags (regex rules + one AST heuristic)
-- LOC counting (effective LOC: non-empty, non-comment)
-- Vulnerability Density: red_flags / LOC * 1000
-- Technical Debt Index (TDI): wC*Complexity + wV*VulnDensity
-- Risk classification with configurable threshold
-- CSV/JSON export
-- Editable security ruleset (regex)
-
 Assumptions:
 - Python-only prototype
 - CFG is intraprocedural per function (P = 1 in this construction)
@@ -121,9 +108,9 @@ DEFAULT_RULES: List[RedFlagRule] = [
 ]
 
 
-# ---------------------------
-# CFG / complexity
-# ---------------------------
+
+# Complexity
+
 
 @dataclass(frozen=True)
 class Node:
@@ -157,8 +144,24 @@ class CFG:
         return len(self.edges)
 
 
-def cyclomatic_complexity(E: int, N: int, P: int = 1) -> int:
+def cyclomatic_complexity_cfg(E: int, N: int, P: int = 1) -> int:
     return E - N + 2 * P
+
+
+def cyclomatic_complexity_decision(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """
+    Decision-based cyclomatic complexity.
+    Counts:
+    - if / elif   -> ast.If
+    - for         -> ast.For
+    - while       -> ast.While
+    - try/except  -> ast.Try
+    """
+    decisions = 0
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.Try)):
+            decisions += 1
+    return decisions + 1
 
 
 def count_boolops(expr: ast.AST) -> int:
@@ -168,6 +171,19 @@ def count_boolops(expr: ast.AST) -> int:
             extra += max(0, len(node.values) - 1)
     return extra
 
+
+def compute_extras(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    extra = 0
+    for node in ast.walk(fn):
+        if isinstance(node, ast.If):
+            extra += count_boolops(node.test)
+        elif isinstance(node, ast.While):
+            extra += count_boolops(node.test)
+        elif isinstance(node, ast.IfExp):
+            extra += 1 + count_boolops(node.test)
+        elif isinstance(node, ast.Assert):
+            extra += count_boolops(node.test)
+    return extra
 
 class CFGBuilder:
     def build_for_function(self, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> CFG:
@@ -274,9 +290,9 @@ class CFGBuilder:
         return {n}, {n}
 
 
-# ---------------------------
-# Findings + aggregation
-# ---------------------------
+
+# Aggregation
+
 
 @dataclass
 class Finding:
@@ -459,14 +475,29 @@ def analyze_functions(source: str, filename: str) -> List[FunctionResult]:
     builder = CFGBuilder()
     out: List[FunctionResult] = []
 
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             cfg = builder.build_for_function(node)
             P = 1
-            base = cyclomatic_complexity(cfg.E, cfg.N, P)
+
+            # Keep CFG values for display/evidence
+            base_cfg = cyclomatic_complexity_cfg(cfg.E, cfg.N, P)
+
+            # Use decision-based complexity as the main score
+            base_decision = cyclomatic_complexity_decision(node)
+
             extras = compute_extras(node)
-            cc = base + extras
-            out.append(FunctionResult(filename, node.name, cc, cfg.E, cfg.N, P, extras))
+            cc = base_decision + extras
+
+            out.append(FunctionResult(
+                file=filename,
+                function=node.name,
+                complexity=cc,
+                E=cfg.E,
+                N=cfg.N,
+                P=P,
+                extras=extras
+            ))
 
     return out
 
@@ -487,9 +518,9 @@ def classify_risk(tdi: float, threshold: float) -> Tuple[str, bool]:
     return "LOW", False
 
 
-# ---------------------------
+
 # UI
-# ---------------------------
+
 
 class CodeShieldApp(tk.Tk):
     def __init__(self) -> None:
@@ -654,9 +685,8 @@ class CodeShieldApp(tk.Tk):
         ttk.Label(bottom, textvariable=self.status).pack(side="right")
         ttk.Label(bottom, text="Scan Python code for complexity and security risk.").pack(side="left")
 
-    # ---------------------------
     # Actions
-    # ---------------------------
+   
 
     def choose_file(self) -> None:
         fp = filedialog.askopenfilename(
